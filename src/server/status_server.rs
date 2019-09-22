@@ -1,11 +1,16 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use futures::future::{err, ok};
-use futures::sync::oneshot::{Receiver, Sender};
+//use futures::sync::oneshot::{Receiver, Sender};
 #[cfg(feature = "failpoints")]
 use futures::Stream;
 use futures::{self, Future};
-use hyper::service::service_fn;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::{Receiver, Sender};
+
+use hyper::service::{make_service_fn, service_fn};
 use hyper::{self, header, Body, Method, Request, Response, Server, StatusCode};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -73,7 +78,7 @@ static FAIL_POINTS_REQUEST_PATH: &str = "/fail";
 pub struct StatusServer {
     thread_pool: ThreadPool,
     tx: Sender<()>,
-    rx: Option<Receiver<()>>,
+    rx: Receiver<()>,
     addr: Option<SocketAddr>,
     config: Arc<TiKvConfig>,
 }
@@ -90,7 +95,7 @@ impl StatusServer {
                 debug!("stopping status server");
             })
             .build();
-        let (tx, rx) = futures::sync::oneshot::channel::<()>();
+        let (tx, rx) = oneshot::channel::<()>();
         StatusServer {
             thread_pool,
             tx,
@@ -218,41 +223,51 @@ impl StatusServer {
         let config = self.config.clone();
 
         // Start to serve.
-        let server = builder.serve(move || {
-            let config = config.clone();
-            // Create a status service.
-            service_fn(
-                    move |req: Request<Body>| -> Box<
-                        dyn Future<Item = Response<Body>, Error = hyper::Error> + Send,
-                    > {
-                        let path = req.uri().path().to_owned();
-                        let method = req.method().to_owned();
 
-                        #[cfg(feature = "failpoints")]
-                        {
-                            if path.starts_with(FAIL_POINTS_REQUEST_PATH) {
-                                return handle_fail_points_request(req);
-                            }
-                        }
+        let make_service = make_service_fn(|_| {
+            async {
+                let config = config.clone();
+                // Create a status service.
+                Ok::<_, hyper::Error>(service_fn(
+                async move |req: Request<Body>| -> std::result::Result<Response<Body>, hyper::Error> {
+                    let path = req.uri().path().to_owned();
+                    let method = req.method().to_owned();
 
-                        match (method, path.as_ref()) {
-                            (Method::GET, "/metrics") => Box::new(ok(Response::new(dump().into()))),
-                            (Method::GET, "/status") => Box::new(ok(Response::default())),
-                            (Method::GET, "/pprof/profile") => Self::dump_prof_to_resp(req),
-                            (Method::GET, "/config") => Self::config_handler(config.clone()),
-                            _ => Box::new(ok(Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .body(Body::empty())
-                                .unwrap())),
+                    #[cfg(feature = "failpoints")]
+                    {
+                        if path.starts_with(FAIL_POINTS_REQUEST_PATH) {
+                            return handle_fail_points_request(req);
                         }
-                    },
-                )
+                    }
+
+                    match (method, path.as_ref()) {
+                        (Method::GET, "/metrics") => Ok(Response::new(dump().into())),
+                        (Method::GET, "/status") => Ok(Response::default()),
+                        //(Method::GET, "/pprof/profile") => Self::dump_prof_to_resp(req),
+                        //(Method::GET, "/config") => Self::config_handler(config.clone()),
+                        _ => Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Body::empty())
+                            .unwrap()),
+                    }
+                },
+            ))
+            }
         });
+        let server = builder.serve(make_service);
         self.addr = Some(server.local_addr());
-        let graceful = server
-            .with_graceful_shutdown(self.rx.take().unwrap())
-            .map_err(|e| error!("Status server error: {:?}", e));
+        let graceful = server.with_graceful_shutdown(async {
+            self.rx.await.ok();
+        });
+        // .map_err(|e| error!("Status server error: {:?}", e));
         self.thread_pool.spawn(graceful);
+
+        // hyper::rt::spawn(async {
+        //     if let Err(e) = graceful.await {
+        //         eprintln!("Status server error: {}", e);
+        //     }
+        // });
+
         Ok(())
     }
 
